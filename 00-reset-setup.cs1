@@ -1,0 +1,15 @@
+#!/usr/bin/env -S dotnet run --file
+#:package Lestaly.General@0.120.0
+#:package Kokuban@0.2.0
+using Lestaly;
+using Lestaly.Cx;
+
+return await Paved.ProceedAsync(async () =>
+{
+    await "dotnet".args("run", "--file", ThisSource.RelativeFile("10-containers-volume-delete.cs1"), "--no-pause").echo().result().success();
+    await "dotnet".args("run", "--file", ThisSource.RelativeFile("01-prepare-cert.cs1"), "--no-pause").echo().result().success();
+    await "dotnet".args("run", "--file", ThisSource.RelativeFile("11-containers-restart.cs1"), "--no-pause").echo().result().success();
+    await "dotnet".args("run", "--file", ThisSource.RelativeFile("21-setup-keycloak.cs1"), "--no-pause").echo().result().success();
+    await "dotnet".args("run", "--file", ThisSource.RelativeFile("12-containers-restart-vaultwarden.cs1"), "--no-pause").echo().result().success();
+    await "dotnet".args("run", "--file", ThisSource.RelativeFile("@@show-service.cs1"), "--no-pause").echo().result().success();
+});

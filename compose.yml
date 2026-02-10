@@ -1,0 +1,178 @@
+name: test-vaultwarden-oidc
+
+volumes:
+  vaultwarden-data:
+  keycloak-db-data:
+
+services:
+  maildump:
+    image: my-maildump
+    pull_policy: never
+    build:
+      context: ./build/mail
+    restart: unless-stopped
+    networks:
+      default:
+        aliases:
+          - maildump-container
+    volumes:
+      - type: bind
+        source: ./maildump
+        target: /var/maildump
+        bind:
+          create_host_path: true
+    environment:
+      - TZ=Asia/Tokyo
+      - MAIL_HOST=myserver.home
+      - MAIL_PORT=25
+      - MAIL_DUMP_DIR=/var/maildump
+
+  keykloak-db:
+    image: postgres:18
+    restart: unless-stopped
+    networks:
+      default:
+        aliases:
+          - keycloak-db-container
+    healthcheck:
+      test: pg_isready --quiet --host localhost --dbname=$${POSTGRES_DB} --username=$${POSTGRES_USER} || exit 1
+      start_period: 60s
+      start_interval: 3s
+      timeout: 5s
+      interval: 300s
+      retries: 3
+    volumes:
+      - type: volume
+        source: keycloak-db-data
+        target: /var/lib/postgresql
+    environment:
+      - TZ=Asia/Tokyo
+      - POSTGRES_USER=keycloak_user
+      - POSTGRES_PASSWORD=keycloak_secret
+      - POSTGRES_DB=keycloak_store
+
+  keykloak:
+    image: my/keycloak
+    pull_policy: never
+    build:
+      context: ./build
+      args:
+        - KEYCLOAK_VERSION=26.5.3
+        - KC_DB=postgres
+        - KC_HEALTH_ENABLED=true
+        - KC_METRICS_ENABLED=true
+    restart: unless-stopped
+    depends_on:
+      keykloak-db:
+        condition: service_healthy
+    networks:
+      default:
+        aliases:
+          - keycloak-app-container
+    healthcheck:
+      test: bash -c "{ printf 'HEAD /health/ready HTTP/1.0\r\n\r\n' >&0; grep 'HTTP/1.0 200'; } 0<>/dev/tcp/localhost/9000"
+      start_period: 30s
+      start_interval: 3s
+      timeout: 5s
+      interval: 300s
+      retries: 3
+    volumes:
+      - type: bind
+        source: ./assets/certs/ca/ca.crt
+        target: /opt/keycloak/conf/truststores/ca.pem
+        read_only: true
+        bind:
+          create_host_path: false
+    environment:
+      - TZ=Asia/Tokyo
+      - KEYCLOAK_ADMIN=keycloak-admin
+      - KEYCLOAK_ADMIN_PASSWORD=admin-password
+      - KC_DB=postgres
+      - KC_DB_USERNAME=keycloak_user
+      - KC_DB_PASSWORD=keycloak_secret
+      - KC_DB_URL_HOST=keycloak-db-container
+      - KC_DB_URL_PORT=5432
+      - KC_DB_URL_DATABASE=keycloak_store
+      - KC_HOSTNAME=keycloak.myserver.home
+      - KC_HTTP_ENABLED=true
+      - KC_HTTP_PORT=8080
+      - KC_MANAGEMENT_PORT=9000
+      - KC_PROXY_HEADERS=xforwarded
+
+  vaultwarden:
+    image: vaultwarden/server:1.35.4
+    restart: unless-stopped
+    command: sh -c "
+          cat /work/certs/ca/ca.crt >> /etc/ssl/certs/ca-certificates.crt
+       && /start.sh
+      "
+    networks:
+      default:
+        aliases:
+          - vaultwarden-app-container
+    healthcheck:
+      test: curl -f -s http://localhost:80 || exit 1
+      start_period: 300s
+      start_interval: 3s
+      timeout: 5s
+      interval: 300s
+      retries: 3
+    volumes:
+      - type: volume
+        source: vaultwarden-data
+        target: /data
+      - type: bind
+        source: ./assets/certs/ca
+        target: /work/certs/ca
+        read_only: true
+        bind:
+          create_host_path: false
+    environment:
+      - TZ=Asia/Tokyo
+      - DOMAIN=https://vaultwarden.myserver.home
+      - INVITATIONS_ALLOWED=true
+      - SIGNUPS_ALLOWED=true
+      # ADMIN_TOKEN=admin-pass
+      - ADMIN_TOKEN=$$argon2id$$v=19$$m=65540,t=3,p=4$$usxm21N0w4LWKCXIbfB8MUW7nChwXu8oUAWcNcF/C1w$$r2xZQyHQLvHaI0NUFaJFgts4TkWlXMq5pv8OcIa1WmU
+      - SMTP_HOST=maildump-container
+      - SMTP_PORT=25
+      - SMTP_SECURITY=off
+      - SMTP_FROM=vaultwarden@myserver.home
+      - SMTP_FROM_NAME=Vaultwarden
+      - SMTP_AUTH_MECHANISM=Plain
+      - SMTP_ACCEPT_INVALID_HOSTNAMES=true
+    env_file:
+      - .vaultwarden.env
+
+  proxy:
+    image: nginx:1.29
+    restart: unless-stopped
+    depends_on:
+      keykloak:
+        condition: service_started
+      vaultwarden:
+        condition: service_started
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - type: bind
+        source: ./assets/proxy/partial
+        target: /work/configs/partial
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./assets/proxy/server
+        target: /etc/nginx/conf.d
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./assets/certs/server
+        target: /work/certs/server
+        read_only: true
+        bind:
+          create_host_path: false
+    environment:
+      - TZ=Asia/Tokyo

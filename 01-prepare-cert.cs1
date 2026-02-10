@@ -1,0 +1,120 @@
+#!/usr/bin/env -S dotnet run --file
+#:package Lestaly.General@0.120.0
+using System.Net;
+using System.Net.NetworkInformation;
+using System.Security.Cryptography;
+using System.Security.Cryptography.X509Certificates;
+using Lestaly;
+
+var settings = new
+{
+    ServerNames = new[]
+    {
+        Environment.MachineName,
+        "myserver.home",
+        "localhost",
+    },
+
+    CA = new
+    {
+        Name = "ca.myserver.home",
+        CertFile = ThisSource.RelativeFile("assets/certs/ca/ca.crt"),
+        KeyFile = ThisSource.RelativeFile("assets/certs/ca/ca.key"),
+    },
+
+    Server = new
+    {
+        Name = "myserver.home",
+        CertFile = ThisSource.RelativeFile("assets/certs/server/server.crt"),
+        KeyFile = ThisSource.RelativeFile("assets/certs/server/server.key"),
+    }
+};
+
+return await Paved.ProceedAsync(noPause: args.RoughContains("--no-pause"), async () =>
+{
+    using var signal = new SignalCancellationPeriod();
+
+    Console.WriteLine("Check CA cert");
+    if (!settings.CA.CertFile.Exists)
+    {
+        Console.WriteLine(".. Generate CA cert");
+        var caKey = ECDsa.Create();
+        var subjectBuilder = new X500DistinguishedNameBuilder();
+        subjectBuilder.AddCommonName(settings.CA.Name);
+
+        var crtReq = new CertificateRequest(subjectBuilder.Build(), caKey, HashAlgorithmName.SHA384);
+        crtReq.CertificateExtensions.Add(X509BasicConstraintsExtension.CreateForCertificateAuthority(pathLengthConstraint: null));
+        crtReq.CertificateExtensions.Add(new X509KeyUsageExtension(keyUsages: X509KeyUsageFlags.KeyCertSign | X509KeyUsageFlags.CrlSign, critical: false));
+        crtReq.CertificateExtensions.Add(new X509SubjectKeyIdentifierExtension(key: crtReq.PublicKey, critical: false));
+
+        var selfSigned = crtReq.CreateSelfSigned(notBefore: DateTimeOffset.Now, notAfter: DateTimeOffset.Now.Add(TimeSpan.FromDays(10 * 365)));
+        await settings.CA.CertFile.WithDirectoryCreate().WriteAllTextAsync(selfSigned.ExportCertificatePem());
+        await settings.CA.KeyFile.WithDirectoryCreate().WriteAllTextAsync(caKey.ExportPkcs8PrivateKeyPem());
+    }
+
+    Console.WriteLine("Check Server cert");
+    if (!settings.Server.CertFile.Exists)
+    {
+        Console.WriteLine(".. Generate Server cert");
+        var serverKey = RSA.Create(4096);
+        var subjectBuilder = new X500DistinguishedNameBuilder();
+        subjectBuilder.AddCommonName(settings.Server.Name);
+
+        var altNameBuilder = new SubjectAlternativeNameBuilder();
+        var ipAddrs = NetworkInterface.GetAllNetworkInterfaces()
+            .Where(nw => nw.OperationalStatus == OperationalStatus.Up)
+            .Where(nw => nw.Supports(NetworkInterfaceComponent.IPv4) || nw.Supports(NetworkInterfaceComponent.IPv6))
+            .SelectMany(nw => nw.GetIPProperties().UnicastAddresses)
+            .ToArray();
+        foreach (var ip in ipAddrs.Distinct())
+        {
+            altNameBuilder.AddIpAddress(ip.Address);
+        }
+        var hostNames = await Task.WhenAll(ipAddrs.Select(ip => Dns.GetHostEntryAsync(ip.Address)));
+        foreach (var name in settings.ServerNames.Concat(hostNames.SelectMany(h => h.Aliases.Prepend(h.HostName))).Distinct())
+        {
+            altNameBuilder.AddDnsName(name);
+            altNameBuilder.AddDnsName($"*.{name}");
+        }
+
+        var issuer = X509Certificate2.CreateFromPem(settings.CA.CertFile.ReadAllText(), settings.CA.KeyFile.ReadAllText());
+
+        var subjectName = subjectBuilder.Build();
+        var crtReq = new CertificateRequest(subjectName, serverKey, HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1);
+        crtReq.CertificateExtensions.Add(altNameBuilder.Build());
+        crtReq.CertificateExtensions.Add(X509BasicConstraintsExtension.CreateForEndEntity(critical: false));
+        crtReq.CertificateExtensions.Add(new X509KeyUsageExtension(keyUsages: X509KeyUsageFlags.DigitalSignature, critical: false));
+        crtReq.CertificateExtensions.Add(new X509EnhancedKeyUsageExtension(enhancedKeyUsages: [new Oid("1.3.6.1.5.5.7.3.1")], critical: false));
+        crtReq.CertificateExtensions.Add(new X509SubjectKeyIdentifierExtension(key: crtReq.PublicKey, critical: false));
+        crtReq.CertificateExtensions.Add(X509AuthorityKeyIdentifierExtension.CreateFromCertificate(issuer, includeKeyIdentifier: true, includeIssuerAndSerial: false));
+
+        var generator = X509SignatureGenerator.CreateForECDsa(issuer.GetECDsaPrivateKey()!);
+
+        var crtSigned = crtReq.Create(
+            issuerName: issuer.IssuerName,
+            generator: generator,
+            notBefore: DateTimeOffset.Now,
+            notAfter: DateTimeOffset.Now.Add(TimeSpan.FromDays(45)),
+            serialNumber: [1]
+        );
+        await settings.Server.CertFile.WithDirectoryCreate().WriteAllTextAsync(crtSigned.ExportCertificatePem());
+        await settings.Server.KeyFile.WithDirectoryCreate().WriteAllTextAsync(serverKey.ExportPkcs8PrivateKeyPem());
+    }
+
+    Console.WriteLine("Check cert store");
+    var caCert = X509Certificate2.CreateFromPem(settings.CA.CertFile.ReadAllText());
+    using var store = new X509Store("Root", StoreLocation.CurrentUser);
+    store.Open(OpenFlags.ReadWrite);
+    if (!store.Certificates.Any(c => c.Equals(caCert)))
+    {
+        var existsCerts = store.Certificates.Where(c => c.SubjectName.Name.Contains(settings.CA.Name)).ToArray();
+        if (0 < existsCerts.Length)
+        {
+            Console.WriteLine(".. Remove existing certs");
+            store.RemoveRange([.. existsCerts]);
+        }
+        Console.WriteLine(".. Register CA cert");
+        store.Add(caCert);
+    }
+
+});
