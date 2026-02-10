@@ -1,0 +1,17 @@
+#!/usr/bin/env -S dotnet run --file
+#:package Lestaly.General@0.120.0
+#:package Kokuban@0.2.0
+using Lestaly;
+using Lestaly.Cx;
+
+var settings = new
+{
+    ServiceUrl = new Uri("https://vaultwarden.myserver.home"),
+};
+
+return await Paved.ProceedAsync(noPause: args.RoughContains("--no-pause"), async () =>
+{
+    var composeFile = ThisSource.RelativeFile("./compose.yml");
+    Console.WriteLine($" {Poster.Link[settings.ServiceUrl]}");
+    Console.WriteLine();
+});
